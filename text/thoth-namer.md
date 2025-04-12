@@ -35,8 +35,8 @@ ThothNamer is a name service that allows users to register and manage human-read
 
 1. **Name Registration**
    - Users can register unique names (subject to validation rules)
-   - A one-time fee is required for registration (for now, but later we plan to introduce renewal anual fees)
-   - Names can be between 3-32 characters
+   - Registration fees vary depending on name length and duration (years)
+   - Names with 1 or more characters are valid, but short names (1–4 chars) are more expensive
 
 2. **Resolution**
    - Registered names can be resolved to their associated addresses
@@ -45,17 +45,21 @@ ThothNamer is a name service that allows users to register and manage human-read
 3. **Management**
    - Name owners can update the resolving address
    - Ownership can be transferred to another address
+   - TTL (time to live) is tracked as an expiration date (YYYY-MM-DD)
+   - Names can be renewed for additional years
 
 ## Usage Example
 
-Alice wants to register "alice.htr" for her wallet:
+Alice wants to register "alice.htr" for her wallet for 2 years:
 
-1. Alice calls the `create_name` function with the name "alice" for the nano contract with domain "htr"
-2. She pays the required registration fee
-3. The name is now registered and resolves to her address
-4. Later, she can:
-   - Change the resolving address to point to a different wallet
-   - Transfer ownership to another user if desired
+1. Alice calls the `create_name` function with the name "alice" and duration `2`
+2. The contract calculates the price based on duration and name length
+3. She pays the required registration fee
+4. The name is now registered and resolves to her address, expiring in 2 years
+5. Later, she can:
+   - Change the resolving address to a different wallet
+   - Renew the name by paying for additional years
+   - Transfer ownership to another user
 
 ## User Benefits
 
@@ -69,7 +73,7 @@ Alice wants to register "alice.htr" for her wallet:
 
 3. **Flexibility**
    - Update resolving addresses without changing identity
-   - Transfer ownership if needed
+   - Renew or transfer ownership as needed
 
 # Reference-level explanation
 
@@ -78,10 +82,11 @@ Alice wants to register "alice.htr" for her wallet:
 ```python
 class ThothNamer(Blueprint):
     domain: str                      # Base domain (e.g., "htr")
-    names: Dict[str, dict[str, Address]]  # Mapping of names to owner/resolving addresses
+    names: Dict[str, dict[str, Any]] # Mapping of names to owner/resolving/ttl
     dev_address: Address             # Developer address for receiving fees
-    fee: Amount                      # Fee for registering a name
+    fee: Amount                      # Base fee per year
     total_fee: Amount                # Total fees collected
+    short_name_multiplier: int      # Fee multiplier for short names (1–4 chars)
 ```
 
 ## Custom Exceptions
@@ -106,28 +111,40 @@ class InvalidToken(NCFail): pass
 
 ```python
 @public
-def initialize(self, ctx: Context, domain: str, fee: Amount) -> None:
+def initialize(self, ctx: Context, domain: str, fee: Amount, short_name_multiplier: int) -> None:
 ```
 
-Initializes the name service by:
-- Setting the base domain name 
-- Establishing the registration fee
-- Setting the developer address to the contract creator
-- Validating inputs (domain not empty, fee positive)
+Initializes the name service:
+- Sets the base domain name and developer address
+- Establishes the base registration fee
+- Sets the short name price multiplier
 
 ### create_name
 
 ```python
 @public
-def create_name(self, ctx: Context, name: str) -> None:
+def create_name(self, ctx: Context, name: str, bought_time: int) -> None:
 ```
 
-Registers a new name with the following workflow:
+Registers a new name:
 - Validates the name format
-- Checks that the name doesn't already exist
-- Verifies sufficient fee payment
-- Maps the name to the caller's address as both owner and resolving address
+- Checks if name already exists
+- Calculates expiration date from `ctx.now` and `bought_time`
+- Calculates fee based on name length and duration
+- Stores owner, resolver, and TTL (`datetime.date`)
 - Updates total fees collected
+
+### renew_name
+
+```python
+@public
+def renew_name(self, ctx: Context, name: str, extra_years: int) -> None:
+```
+
+Renews the TTL of an existing name:
+- Validates ownership
+- Adds extra years to expiration
+- Applies the appropriate fee again
 
 ### change_fee
 
@@ -136,10 +153,16 @@ Registers a new name with the following workflow:
 def change_fee(self, ctx: Context, fee: Amount) -> None:
 ```
 
-Allows the developer to update the registration fee:
-- Verifies caller is the developer
-- Ensures the new fee is a positive value
-- Updates the fee amount
+Allows the developer to update the base registration fee.
+
+### change_short_name_multiplier
+
+```python
+@public
+def change_short_name_multiplier(self, ctx: Context, multiplier: int) -> None:
+```
+
+Allows the developer to update the price multiplier for short names.
 
 ### change_dev_address
 
@@ -148,9 +171,7 @@ Allows the developer to update the registration fee:
 def change_dev_address(self, ctx: Context, new_dev_address: Address) -> None:
 ```
 
-Enables the current developer to transfer control:
-- Verifies caller is the current developer
-- Updates the developer address to the new address
+Allows developer to transfer admin rights to another address.
 
 ### change_name_owner
 
@@ -159,10 +180,7 @@ Enables the current developer to transfer control:
 def change_name_owner(self, ctx: Context, name: str, new_owner_address: Address) -> None:
 ```
 
-Transfers name ownership to a new address:
-- Verifies the name exists
-- Ensures caller is the current owner
-- Updates owner information while preserving resolving address
+Transfers ownership of a name to another address.
 
 ### change_resolving_address
 
@@ -171,10 +189,7 @@ Transfers name ownership to a new address:
 def change_resolving_address(self, ctx: Context, name: str, new_resolving_address: Address) -> None:
 ```
 
-Updates where a name resolves to:
-- Verifies the name exists
-- Ensures caller is the owner
-- Updates resolving address while preserving ownership information
+Updates the resolving address for a registered name.
 
 ## View Methods
 
@@ -185,9 +200,7 @@ Updates where a name resolves to:
 def resolve_name(self, name: str) -> str:
 ```
 
-Retrieves the address associated with a name:
-- Verifies the name exists
-- Returns the resolving address in Base58 format
+Returns the resolving address for a given name.
 
 ### validate_name
 
@@ -196,11 +209,10 @@ Retrieves the address associated with a name:
 def validate_name(self, name: str) -> bool:
 ```
 
-Implements name validation rules:
-- Length between 3-32 characters
-- Only lowercase letters, numbers, and hyphens allowed
-- No hyphens at beginning or end
-- Non-empty string
+Validates name format:
+- Must be non-empty
+- Cannot start or end with hyphen `-`
+- Only lowercase letters, numbers, and hyphens are allowed
 
 ### check_name_existence
 
@@ -209,9 +221,16 @@ Implements name validation rules:
 def check_name_existence(self, name: str) -> bool:
 ```
 
-Checks if a name is already registered:
-- Returns true if name exists in registry
-- Returns false otherwise
+Returns whether the name exists and is not expired.
+
+### check_name_expired
+
+```python
+@view
+def check_name_expired(self, name: str) -> bool:
+```
+
+Returns whether the name’s TTL has passed.
 
 ### get_name_owner
 
@@ -220,9 +239,16 @@ Checks if a name is already registered:
 def get_name_owner(self, name: str) -> Address:
 ```
 
-Retrieves the owner of a registered name:
-- Verifies the name exists
-- Returns owner's address in Base58 format
+Returns the current owner of the name.
+
+### get_name_ttl
+
+```python
+@view
+def get_name_ttl(self, name: str) -> str:
+```
+
+Returns the name’s expiration date in ISO format (`YYYY-MM-DD`).
 
 ### get_dev_address
 
@@ -231,7 +257,7 @@ Retrieves the owner of a registered name:
 def get_dev_address(self) -> Address:
 ```
 
-Returns the current developer address in Base58 format.
+Returns the developer address.
 
 ### get_contract_domain
 
@@ -240,7 +266,7 @@ Returns the current developer address in Base58 format.
 def get_contract_domain(self) -> str:
 ```
 
-Returns the base domain for the name service.
+Returns the current contract domain.
 
 ## Helper Methods
 
@@ -250,86 +276,73 @@ Returns the base domain for the name service.
 def _get_action(self, ctx: Context) -> NCAction:
 ```
 
-Internal utility for processing transactions:
-- Ensures only one action is present
-- Restricts withdrawals to developer
-- Validates token type is HTR
-- Returns the action for processing
+Validates and returns the payment action.
 
-### _update_resolving_address and _update_owner_address
+### _calculate_fee
 
-Internal utilities that handle updates to the names dictionary.
+```python
+def _calculate_fee(self, name: str, years: int) -> Amount:
+```
+
+Calculates total price:
+- `fee * years`
+- If name has 1–4 characters, apply `short_name_multiplier`
+
+### _calculate_expiration_date
+
+```python
+def _calculate_expiration_date(self, timestamp: int, years: int) -> date:
+```
+
+Converts timestamp and years into a `datetime.date` expiration.
 
 ## Name Data Structure
 
 ```python
 name_entry = {
-    "owner_address": Address,      # The address that controls the name
-    "resolving_address": Address   # The address that the name resolves to
+    "owner_address": Address,
+    "resolving_address": Address,
+    "ttl": date  # Expiration date
 }
 ```
 
 # Drawbacks
 
-1. No built-in mechanism for name expiration or renewals
-2. Potential for name squatting without a progressive fee structure
-3. Limited metadata storage capability
+1. No off-chain dispute resolution system for trademark conflicts
+2. Name squatting still possible despite pricing model
+3. No automatic purging of expired names (manual renewal only)
 
 # Rationale and alternatives
 
-The chosen design prioritizes:
+The design prioritizes:
 
-1. Simplicity in implementation and user interaction
-2. Clear ownership and management rights
-3. Minimal state storage requirements
-4. Integration with existing Hathor features
+1. Simplicity and minimal gas usage
+2. Full ownership control and upgradability
+3. Customizability of pricing and expiration terms
 
 Alternatives considered:
 
-1. ENS-style hierarchical domains
-   - More complex implementation
-   - Higher gas costs
-   - More flexible namespace
-
-2. Time-limited registration with renewals
-   - Requires more complex time tracking
-   - Higher maintenance burden on users
-   - Potentially more efficient use of namespace
-
-3. Auction-based name allocation
-   - More complex implementation
-   - Potentially higher fees for popular names
-   - Fairer distribution of valuable names
+- ENS-style subdomain hierarchies (more complex, higher cost)
+- Auction-based name bidding
+- Flat-fee renewals with grace periods
 
 # Prior art
 
-ThothNamer draws inspiration from several existing name services while adapting for Hathor's specific architecture:
-
-1. Ethereum Name Service (ENS)
-   - Simplified structure compared to ENS's hierarchical system
-   - Single domain vs multiple TLDs
-   - Similar ownership transfer mechanism
-
-2. Handshake
-   - Simplified approach compared to Handshake's complete DNS alternative
-   - Focus on application-specific names rather than internet naming
-
-3. Namecoin
-   - Similar concept of blockchain-based name registration
-   - More specific focus on Hathor addresses vs Namecoin's broader scope
+- **Ethereum Name Service (ENS)** – inspired flexible ownership/resolver separation
+- **Namecoin** – early on-chain identity concept
+- **Handshake** – focus on full DNS decentralization (not needed here)
 
 # Unresolved questions
 
-1. How should disputes over trademarked names be handled?
-2. Is there a need for a name expiration mechanism to prevent dormant addresses?
-3. Should fees be adjustable based on name length or desirability?
-4. How will applications integrate with the name resolution system?
+1. Should expired names be automatically removed or remain inert?
+2. Should there be a public grace period before full expiration?
+3. Could additional metadata be stored with names (e.g., social links)?
 
 # Future possibilities
 
-1. Integration with off-chain identity verification
-2. Adding metadata support for avatars, descriptions, and social links
-3. Implementing name expirations and renewals
-4. Creating a marketplace for name trading
-5. Adding support for subdomains (e.g., payments.alice.htr)
-6. Governance mechanism for contract parameter adjustments
+1. Name marketplace and trading support
+2. Optional off-chain identity linkage and proof of personhood
+3. Expiration notifications or renewals via oracles
+4. Integration into wallets and dApps for native name resolution
+5. DAO governance for fee and multiplier adjustments
+6. Metadata fields for profile pictures, links, and reputation
